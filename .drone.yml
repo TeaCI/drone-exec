@@ -1,23 +1,21 @@
+workspace:
+  base: /go
+  path: src/github.com/drone/drone-exec
 
-build:
-  image: golang:1.5
-  environment:
-    - GOPATH=/drone
-    - GO15VENDOREXPERIMENT=1
-    - GOOS=linux
-    - GOARCH=amd64
-    - CGO_ENABLED=0
-  commands:
-    - go get github.com/franela/goblin
-    - go get ./...
-    - go test ./...
-    - go build
+pipeline:
+  build:
+    image: golang:1.6.2-alpine
+    commands:
+      - go test github.com/drone/drone-exec/agent/...
+      - go test github.com/drone/drone-exec/build/...
+      - go test github.com/drone/drone-exec/yaml/...
+      - go build
 
-publish:
-  docker:
-    username: drone
-    password: $$DOCKER_PASS
-    email: $$DOCKER_EMAIL
-    repo: drone/drone-exec
+  publish:
+    image: docker
+    repo: drone/agent
+    tags: [ "latest", "0.5.0", "0.5" ]
+    storage_driver: overlay
     when:
+      event: push
       branch: master

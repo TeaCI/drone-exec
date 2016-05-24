@@ -1,62 +1,211 @@
 package main
 
 import (
-	"bytes"
-	"flag"
-	"fmt"
 	"os"
+	"sync"
+	"time"
 
-	"github.com/drone/drone-exec/exec"
-	"github.com/drone/drone-exec/yaml"
-	"github.com/drone/drone-plugin-go/plugin"
+	"github.com/drone/drone-exec/client"
+	"github.com/drone/drone-exec/token"
+	"github.com/samalba/dockerclient"
 
-	log "github.com/Sirupsen/logrus"
+	"github.com/Sirupsen/logrus"
+	"github.com/codegangsta/cli"
+	_ "github.com/joho/godotenv/autoload"
 )
 
 func main() {
-	var opt exec.Options
-
-	// parses command line flags
-	flag.BoolVar(&opt.Cache, "cache", false, "")
-	flag.BoolVar(&opt.Clone, "clone", false, "")
-	flag.BoolVar(&opt.Build, "build", false, "")
-	flag.BoolVar(&opt.Deploy, "deploy", false, "")
-	flag.BoolVar(&opt.Notify, "notify", false, "")
-	flag.BoolVar(&opt.Debug, "debug", false, "")
-	flag.BoolVar(&opt.Force, "pull", false, "")
-	flag.StringVar(&opt.Mount, "mount", "", "")
-	flag.Parse()
-
-	// unmarshal the json payload via stdin or
-	// via the command line args (whichever was used)
-	var payload exec.Payload
-	if err := plugin.MustUnmarshal(&payload); err != nil {
-		log.Fatalln(err)
+	app := cli.NewApp()
+	app.Name = "agent"
+	app.Usage = "drone build agent"
+	app.Action = start
+	app.Flags = []cli.Flag{
+		cli.StringFlag{
+			EnvVar: "DOCKER_HOST",
+			Name:   "docker-host",
+			Usage:  "docker deamon address",
+			Value:  "unix:///var/run/docker.sock",
+		},
+		cli.BoolFlag{
+			EnvVar: "DOCKER_TLS_VERIFY",
+			Name:   "docker-tls-verify",
+			Usage:  "docker daemon supports tlsverify",
+		},
+		cli.StringFlag{
+			EnvVar: "DOCKER_CERT_PATH",
+			Name:   "docker-cert-path",
+			Usage:  "docker certificate directory",
+			Value:  "",
+		},
+		cli.IntFlag{
+			EnvVar: "DOCKER_MAX_PROCS",
+			Name:   "docker-max-procs",
+			Usage:  "limit number of running docker processes",
+			Value:  2,
+		},
+		cli.StringFlag{
+			EnvVar: "DOCKER_OS",
+			Name:   "docker-os",
+			Usage:  "docker operating system",
+			Value:  "linux",
+		},
+		cli.StringFlag{
+			EnvVar: "DOCKER_ARCH",
+			Name:   "docker-arch",
+			Usage:  "docker architecture system",
+			Value:  "amd64",
+		},
+		cli.StringFlag{
+			EnvVar: "DRONE_STORAGE_DRIVER",
+			Name:   "drone-storage-driver",
+			Usage:  "docker storage driver",
+			Value:  "overlay",
+		},
+		cli.StringFlag{
+			EnvVar: "DRONE_SERVER",
+			Name:   "drone-server",
+			Usage:  "drone server address",
+			Value:  "http://localhost:8000",
+		},
+		cli.StringFlag{
+			EnvVar: "DRONE_TOKEN",
+			Name:   "drone-token",
+			Usage:  "drone authorization token",
+		},
+		cli.StringFlag{
+			EnvVar: "DRONE_SECRET,DRONE_AGENT_SECRET",
+			Name:   "drone-secret",
+			Usage:  "drone agent secret",
+		},
+		cli.DurationFlag{
+			EnvVar: "DRONE_BACKOFF",
+			Name:   "backoff",
+			Usage:  "drone server backoff interval",
+			Value:  time.Second * 15,
+		},
+		cli.DurationFlag{
+			EnvVar: "DRONE_PING",
+			Name:   "ping",
+			Usage:  "drone server ping frequency",
+			Value:  time.Minute * 5,
+		},
+		cli.BoolFlag{
+			EnvVar: "DRONE_DEBUG",
+			Name:   "debug",
+			Usage:  "start the agent in debug mode",
+		},
+		cli.DurationFlag{
+			EnvVar: "DRONE_TIMEOUT",
+			Name:   "timeout",
+			Usage:  "drone timeout due to log inactivity",
+			Value:  time.Minute * 5,
+		},
+		cli.IntFlag{
+			EnvVar: "DRONE_MAX_LOGS",
+			Name:   "max-log-size",
+			Usage:  "drone maximum log size in megabytes",
+			Value:  5,
+		},
+		cli.StringSliceFlag{
+			EnvVar: "DRONE_PLUGIN_PRIVILEGED",
+			Name:   "privileged",
+			Usage:  "plugins that require privileged mode",
+			Value: &cli.StringSlice{
+				"plugins/docker",
+				"plugins/docker:*",
+				"plugins/gcr",
+				"plugins/gcr:*",
+				"plugins/ecr",
+				"plugins/ecr:*",
+			},
+		},
+		cli.StringFlag{
+			EnvVar: "DRONE_PLUGIN_NAMESPACE",
+			Name:   "namespace",
+			Value:  "plugins",
+			Usage:  "default plugin image namespace",
+		},
+		cli.BoolTFlag{
+			EnvVar: "DRONE_PLUGIN_PULL",
+			Name:   "pull",
+			Usage:  "always pull latest plugin images",
+		},
 	}
 
-	// configure the default log format and
-	// log levels
-	debugFlag := yaml.ParseDebugString(payload.Yaml)
-	if debugFlag {
-		log.SetLevel(log.DebugLevel)
-	}
-	log.SetFormatter(new(formatter))
-
-	err := exec.Exec(payload, opt, os.Stdout, os.Stdout)
-	if err != nil {
-		log.Println(err)
-		switch err := err.(type) {
-		case *exec.Error:
-			os.Exit(err.ExitCode)
-		}
-		os.Exit(1)
+	if err := app.Run(os.Args); err != nil {
+		logrus.Fatal(err)
 	}
 }
 
-type formatter struct{}
+func start(c *cli.Context) error {
 
-func (f *formatter) Format(entry *log.Entry) ([]byte, error) {
-	buf := &bytes.Buffer{}
-	fmt.Fprintf(buf, "[%s] %s\n", entry.Level.String(), entry.Message)
-	return buf.Bytes(), nil
+	// debug level if requested by user
+	if c.Bool("debug") {
+		logrus.SetLevel(logrus.DebugLevel)
+	} else {
+		logrus.SetLevel(logrus.WarnLevel)
+	}
+
+	var accessToken string
+	if c.String("drone-secret") != "" {
+		accessToken, _ = token.New(c.String("drone-secret"))
+	} else {
+		accessToken = c.String("drone-token")
+	}
+
+	logrus.Infof("Connecting to %s with token %s",
+		c.String("drone-server"),
+		accessToken,
+	)
+
+	client := client.NewClientToken(
+		c.String("drone-server"),
+		accessToken,
+	)
+
+	tls, err := dockerclient.TLSConfigFromCertPath(c.String("docker-cert-path"))
+	if err == nil {
+		tls.InsecureSkipVerify = c.Bool("docker-tls-verify")
+	}
+	docker, err := dockerclient.NewDockerClient(c.String("docker-host"), tls)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	go func() {
+		for {
+			if err := client.Ping(); err != nil {
+				logrus.Warnf("unable to ping the server. %s", err.Error())
+			}
+			time.Sleep(c.Duration("ping"))
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < c.Int("docker-max-procs"); i++ {
+		wg.Add(1)
+		go func() {
+			r := pipeline{
+				drone:  client,
+				docker: docker,
+				config: config{
+					platform:   c.String("docker-os") + "/" + c.String("docker-arch"),
+					timeout:    c.Duration("timeout"),
+					namespace:  c.String("namespace"),
+					privileged: c.StringSlice("privileged"),
+					pull:       c.BoolT("pull"),
+					logs:       int64(c.Int("max-log-size")) * 1000000,
+				},
+			}
+			for {
+				if err := r.run(); err != nil {
+					dur := c.Duration("backoff")
+					logrus.Warnf("reconnect in %v. %s", dur, err.Error())
+					time.Sleep(dur)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
 }
